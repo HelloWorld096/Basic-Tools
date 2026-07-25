@@ -1,0 +1,1002 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>Local Model Hub & Background Remover</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          accent: '#2f5eff',
+          'accent-dim': '#eef1ff',
+          ink: '#12151b',
+          'ink-dim': '#5b6472',
+          'ink-faint': '#8b93a1',
+          bad: '#d92d20',
+          good: '#12875a'
+        },
+        fontFamily: {
+          mono: ['ui-monospace', 'SFMono-Regular', 'SF Mono', 'Menlo', 'Consolas', 'monospace']
+        }
+      }
+    }
+  };
+</script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cropperjs/1.6.2/cropper.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.18.0/ort.min.js"></script>
+<style>
+  html, body { background:#f3f4f6; color:#12151b; -webkit-font-smoothing:antialiased; }
+  body { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
+  @media (min-width: 768px) { body { padding-bottom: 0; } }
+
+  .checkerboard {
+    background-image: linear-gradient(45deg, #d9dbe0 25%, transparent 25%), linear-gradient(-45deg, #d9dbe0 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #d9dbe0 75%), linear-gradient(-45deg, transparent 75%, #d9dbe0 75%);
+    background-size: 16px 16px;
+    background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
+  }
+  .spinner { width:13px; height:13px; border-radius:9999px; border:2px solid #eef1ff; border-top-color:#2f5eff; animation: spin .7s linear infinite; flex:none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .btn { background:#2f5eff; color:#fff; border:none; padding:9px 16px; border-radius:9px; font-weight:600; font-size:.85rem; cursor:pointer; min-height:40px; white-space:nowrap; }
+  .btn:hover:not(:disabled) { filter:brightness(1.08); }
+  .btn:disabled { background:#c7cbd3; cursor:not-allowed; }
+  .btn-danger { background:#d92d20; }
+  .btn-ghost { background:#fff; border:1px solid #e5e7eb; color:#12151b; padding:9px 16px; border-radius:9px; font-weight:600; font-size:.85rem; cursor:pointer; min-height:40px; }
+  .btn-ghost-sm { background:#fff; border:1px solid #e5e7eb; color:#12151b; padding:5px 11px; border-radius:8px; font-weight:600; font-size:.78rem; cursor:pointer; }
+  .aspect-btn { font-size:.76rem; font-weight:600; padding:6px 10px; border-radius:8px; border:1px solid #e5e7eb; background:#fff; color:#5b6472; cursor:pointer; }
+  .bg-mode-btn { font-size:.8rem; font-weight:600; padding:7px 14px; border-radius:9px; border:1px solid #e5e7eb; background:#fff; color:#5b6472; cursor:pointer; }
+
+  .cropper-crop-box, .cropper-view-box { outline-color: #2f5eff; }
+  #cropImage { display:block; max-width:100%; }
+</style>
+</head>
+<body class="font-sans">
+
+<header class="bg-white border-b border-gray-200 px-5 py-3.5 sticky top-0 z-40 md:flex md:items-center md:justify-between">
+  <div class="flex items-center gap-2.5">
+    <span class="w-[9px] h-[9px] rounded-full bg-accent shadow-[0_0_0_4px_#eef1ff]"></span>
+    <h1 class="text-sm font-bold tracking-tight m-0">Local AI Hub</h1>
+  </div>
+  <p class="ml-[19px] mt-0.5 text-xs text-ink-faint md:hidden">Models run entirely in your browser</p>
+  <nav class="hidden md:flex gap-1">
+    <button class="tab-btn active px-3.5 py-2 rounded-lg text-sm font-semibold text-accent bg-accent-dim" data-tab="downloader" onclick="switchTab('downloader', this)">Downloader</button>
+    <button class="tab-btn px-3.5 py-2 rounded-lg text-sm font-semibold text-ink-dim hover:bg-gray-100" data-tab="manager" onclick="switchTab('manager', this)">Manager & Upload</button>
+    <button class="tab-btn px-3.5 py-2 rounded-lg text-sm font-semibold text-ink-dim hover:bg-gray-100" data-tab="studio" onclick="switchTab('studio', this)">Studio</button>
+  </nav>
+</header>
+
+<div class="max-w-[820px] mx-auto px-4 pt-5 pb-8">
+
+  <!-- TAB 1: DOWNLOADER -->
+  <div id="downloader" class="tab-content">
+    <h2 class="text-xl font-bold tracking-tight mt-1 mb-1">Download local models</h2>
+    <p class="text-ink-dim text-sm mb-4 leading-relaxed">Each model is fetched directly to your device and saved in browser storage (IndexedDB) — nothing is uploaded anywhere.</p>
+    <div id="catalog"></div>
+  </div>
+
+  <!-- TAB 2: MANAGER & UPLOADER -->
+  <div id="manager" class="tab-content hidden">
+    <h2 class="text-xl font-bold tracking-tight mt-1 mb-1">Manager & upload</h2>
+    <p class="text-ink-dim text-sm mb-4 leading-relaxed">Bring your own <code class="font-mono bg-gray-100 px-1.5 py-0.5 rounded">.onnx</code> files, or manage what's already stored on this device.</p>
+
+    <div class="bg-white border border-gray-200 rounded-2xl p-4 mb-3.5">
+      <h3 class="mt-0 mb-2 text-sm font-bold">Upload from disk</h3>
+      <div class="border-[1.5px] border-dashed border-gray-300 rounded-xl px-4 py-7 text-center bg-gray-50 cursor-pointer hover:bg-accent-dim hover:border-accent transition-colors" id="dropzone" tabindex="0" role="button" aria-label="Upload ONNX models">
+        <div class="text-xl">📁</div>
+        <p class="mt-2 text-sm text-ink-dim">Tap to choose, or drag <code class="font-mono bg-gray-100 px-1.5 py-0.5 rounded">.onnx</code> files here</p>
+        <input type="file" id="fileInput" accept=".onnx" multiple class="hidden" />
+      </div>
+      <div class="text-sm text-bad mt-2" id="uploadError"></div>
+    </div>
+
+    <h3 class="text-sm font-bold mt-5 mb-2.5">Stored on this device</h3>
+    <div id="modelList" class="text-center py-8 px-4 text-ink-faint text-sm">Loading local models…</div>
+  </div>
+
+  <!-- TAB 3: USER STUDIO -->
+  <div id="studio" class="tab-content hidden">
+    <h2 class="text-xl font-bold tracking-tight mt-1 mb-1">Background removal studio</h2>
+    <p class="text-ink-dim text-sm mb-4 leading-relaxed">Inference runs fully offline in the browser via WebAssembly — your image is never sent anywhere.</p>
+
+    <div class="bg-white border border-gray-200 rounded-2xl p-4 mb-3.5">
+      <label for="modelSelect" class="text-sm font-semibold">Model</label>
+      <select id="modelSelect" class="w-full px-3 py-2.5 mt-2 mb-1 rounded-lg border border-gray-200 text-sm bg-white min-h-[42px]">
+        <option value="">-- Choose an installed model --</option>
+      </select>
+
+      <div class="mt-3">
+        <label for="inputSizeField" class="text-sm font-semibold">Model input size (px)</label>
+        <div class="flex items-center gap-2 mt-2">
+          <input type="number" id="inputSizeField" value="320" min="32" max="1024" step="16" class="w-24 px-3 py-2 rounded-lg border border-gray-200 text-sm" />
+          <span class="text-xs text-ink-faint">Default 320 · used only if this model needs a different fixed resolution</span>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2.5 mt-4">
+        <input type="file" id="imageInput" accept="image/*" disabled class="text-sm max-w-full" />
+      </div>
+
+      <div class="mt-2.5 text-sm font-semibold text-accent flex items-center gap-2" id="studioStatusLine">
+        <span id="statusText">Select a model to begin</span>
+      </div>
+
+      <div class="hidden mt-3 bg-[#0d1117] rounded-lg px-3.5 py-3 font-mono text-xs leading-[1.85]" id="processConsole"></div>
+    </div>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+      <div class="bg-white border border-gray-200 rounded-2xl p-2.5 text-center">
+        <h4 class="mt-0 mb-2 text-[0.7rem] uppercase tracking-wide text-ink-faint font-bold">Original (cropped)</h4>
+        <img id="origPreview" class="max-w-full h-auto rounded-lg checkerboard" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'></svg>" />
+        <div class="font-mono text-xs text-ink-faint mt-1.5" id="origDims"></div>
+      </div>
+      <div class="bg-white border border-gray-200 rounded-2xl p-2.5 text-center">
+        <h4 class="mt-0 mb-2 text-[0.7rem] uppercase tracking-wide text-ink-faint font-bold">Result</h4>
+        <canvas id="compositeCanvas" class="max-w-full h-auto rounded-lg checkerboard touch-none mx-auto"></canvas>
+        <div class="font-mono text-xs text-ink-faint mt-1.5" id="outDims"></div>
+      </div>
+    </div>
+
+    <div id="bgPanel" class="hidden bg-white border border-gray-200 rounded-2xl p-4 mt-3.5">
+      <p class="text-xs font-bold text-ink-dim uppercase tracking-wide mb-2">Background</p>
+      <div class="flex gap-2 flex-wrap" id="bgModeButtons">
+        <button class="bg-mode-btn" data-mode="transparent">Transparent</button>
+        <button class="bg-mode-btn" data-mode="color">Solid color</button>
+        <button class="bg-mode-btn" data-mode="image">Image</button>
+      </div>
+
+      <div id="colorControls" class="hidden mt-4 flex gap-5 flex-wrap items-start">
+        <canvas id="colorWheel" width="160" height="160" class="rounded-full cursor-crosshair touch-none"></canvas>
+        <canvas id="valueBar" width="22" height="160" class="rounded-md cursor-pointer touch-none"></canvas>
+        <div class="flex flex-col gap-2">
+          <div class="flex items-center gap-2">
+            <div id="colorSwatch" class="w-8 h-8 rounded-md border border-gray-300"></div>
+            <input id="hexInput" type="text" value="#FFFFFF" class="w-24 font-mono text-xs border border-gray-200 rounded-md px-2 py-1.5" />
+          </div>
+          <p class="text-xs text-ink-faint max-w-[160px] leading-snug">Drag on the wheel to set hue and saturation. Drag the bar for lightness — up toward white for tints, down toward black for shades.</p>
+        </div>
+      </div>
+
+      <div id="imageControls" class="hidden mt-4">
+        <input type="file" id="bgImageInput" accept="image/*" class="text-sm" />
+        <p class="text-xs text-ink-faint mt-2 leading-snug">Once loaded: drag with your finger or mouse to move the background, and scroll, pinch, or use the buttons below to zoom. Your subject stays fixed in place.</p>
+        <div class="flex gap-2 mt-2.5">
+          <button id="bgZoomOut" class="btn-ghost-sm">− Zoom out</button>
+          <button id="bgZoomIn" class="btn-ghost-sm">+ Zoom in</button>
+          <button id="bgReset" class="btn-ghost-sm">Reset</button>
+        </div>
+      </div>
+    </div>
+
+    <button id="downloadBtn" class="btn hidden mt-3.5">⬇ Download PNG (optional)</button>
+  </div>
+
+</div>
+
+<!-- Crop modal -->
+<div id="cropModal" class="hidden fixed inset-0 z-[100] bg-black/70 flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl p-4 w-full max-w-lg">
+    <h3 class="text-sm font-bold mb-2.5">Crop your image</h3>
+    <div class="h-72 sm:h-96 bg-gray-100 rounded-xl overflow-hidden">
+      <img id="cropImage" />
+    </div>
+    <div class="flex gap-2 flex-wrap mt-3" id="aspectButtons">
+      <button data-ratio="NaN" class="aspect-btn">Free</button>
+      <button data-ratio="1" class="aspect-btn">1:1</button>
+      <button data-ratio="1.3333" class="aspect-btn">4:3</button>
+      <button data-ratio="1.7778" class="aspect-btn">16:9</button>
+      <button data-ratio="0.5625" class="aspect-btn">9:16</button>
+      <button data-ratio="0.7778" class="aspect-btn">7:9</button>
+    </div>
+    <div class="flex justify-end gap-2 mt-4">
+      <button id="cropCancel" class="btn-ghost">Cancel</button>
+      <button id="cropConfirm" class="btn">Use crop</button>
+    </div>
+  </div>
+</div>
+
+<nav class="fixed left-0 right-0 bottom-0 flex bg-white border-t border-gray-200 z-40 md:hidden" style="padding-bottom: env(safe-area-inset-bottom);">
+  <button class="tab-btn active flex-1 flex flex-col items-center gap-0.5 py-2 text-accent" data-tab="downloader" onclick="switchTab('downloader', this)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="w-[21px] h-[21px]"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 20h16"/></svg>
+    <span class="text-[0.68rem] font-semibold">Download</span>
+  </button>
+  <button class="tab-btn flex-1 flex flex-col items-center gap-0.5 py-2 text-ink-faint" data-tab="manager" onclick="switchTab('manager', this)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="w-[21px] h-[21px]"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/></svg>
+    <span class="text-[0.68rem] font-semibold">Manage</span>
+  </button>
+  <button class="tab-btn flex-1 flex flex-col items-center gap-0.5 py-2 text-ink-faint" data-tab="studio" onclick="switchTab('studio', this)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="w-[21px] h-[21px]"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="1.5" fill="currentColor" stroke="none"/><path d="M21 15l-5-5L5 21"/></svg>
+    <span class="text-[0.68rem] font-semibold">Studio</span>
+  </button>
+</nav>
+
+<script>
+  if (window.ort) {
+    ort.env.wasm.wasmPaths = "https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.18.0/";
+  }
+
+  // -------------------------------------------------------------
+  // Catalog
+  // -------------------------------------------------------------
+  const MODEL_CATALOG = [
+    { id: "modnet_quant", name: "MODNet (Quantized)", size: "14 MB", desc: "Ultra-fast portrait matting model fine-tuned for humans.", url: "https://huggingface.co/Xenova/modnet/resolve/main/onnx/model_quantized.onnx" },
+    { id: "u2netp", name: "U2Net Portable (u2netp)", size: "4.7 MB", desc: "Ultra-lightweight general object segmentation model.", url: "https://huggingface.co/chwshuang/Stable_diffusion_remove_background_model/resolve/main/u2netp.onnx" },
+    { id: "u2net_human", name: "U2Net Human Segmentation", size: "176 MB", desc: "High quality segmentation for humans, hair, and clothing.", url: "https://huggingface.co/chwshuang/Stable_diffusion_remove_background_model/resolve/main/u2net_human_seg.onnx" },
+    { id: "isnet_rmbg", name: "RMBG-1.4 / ISNet", size: "176 MB", desc: "Balanced high-precision model for e-commerce, studio shots, and complex edges.", url: "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model.onnx" }
+  ];
+
+  // -------------------------------------------------------------
+  // IndexedDB
+  // -------------------------------------------------------------
+  function openDB() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open("LocalModelDB", 1);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains("models")) db.createObjectStore("models", { keyPath: "name" });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function dbPut(record) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("models", "readwrite");
+      tx.objectStore("models").put(record);
+      tx.oncomplete = () => resolve(record);
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+  async function dbGetAll() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("models", "readonly");
+      const req = tx.objectStore("models").getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function dbGet(name) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("models", "readonly");
+      const req = tx.objectStore("models").get(name);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function dbDelete(name) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("models", "readwrite");
+      tx.objectStore("models").delete(name);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  // -------------------------------------------------------------
+  // Tab navigation
+  // -------------------------------------------------------------
+  function switchTab(tabId, btnEl) {
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+    document.getElementById(tabId).classList.remove('hidden');
+
+    document.querySelectorAll('.tab-btn').forEach(el => {
+      const active = el.dataset.tab === tabId;
+      el.classList.toggle('active', active);
+      el.classList.toggle('text-accent', active);
+      el.classList.toggle('bg-accent-dim', active && el.closest('nav.hidden.md\\:flex') !== null);
+      el.classList.toggle('text-ink-dim', !active && el.closest('header') !== null);
+      el.classList.toggle('text-ink-faint', !active && el.closest('nav')?.classList.contains('md:hidden'));
+    });
+
+    if (tabId === 'manager') renderManagerList();
+    if (tabId === 'studio') populateStudioSelect();
+  }
+
+  // -------------------------------------------------------------
+  // Process console
+  // -------------------------------------------------------------
+  function createConsole(el) {
+    el.classList.remove('hidden');
+    el.innerHTML = '';
+    let lines = [];
+    return {
+      addStep(label) {
+        const idx = lines.length;
+        const row = document.createElement('div');
+        row.className = 'flex gap-2 items-baseline text-gray-100';
+        row.innerHTML = `<span class="w-3.5 flex-none text-center">›</span><span>${label}<div class="text-[0.74rem] text-gray-400" data-detail></div></span>`;
+        el.appendChild(row);
+        lines.push(row);
+        return idx;
+      },
+      detail(idx, text) { lines[idx].querySelector('[data-detail]').textContent = text; },
+      complete(idx) {
+        lines[idx].classList.remove('text-gray-100');
+        lines[idx].classList.add('text-emerald-400');
+        lines[idx].querySelector('span').textContent = '✓';
+      },
+      fail(idx, text) {
+        lines[idx].classList.remove('text-gray-100');
+        lines[idx].classList.add('text-red-400');
+        lines[idx].querySelector('span').textContent = '✕';
+        if (text) this.detail(idx, text);
+      }
+    };
+  }
+
+  // -------------------------------------------------------------
+  // Downloader
+  // -------------------------------------------------------------
+  function renderCatalog() {
+    const container = document.getElementById('catalog');
+    container.innerHTML = "";
+    MODEL_CATALOG.forEach(model => {
+      const card = document.createElement('div');
+      card.className = 'bg-white border border-gray-200 rounded-2xl p-4 mb-3.5';
+      card.innerHTML = `
+        <div class="flex justify-between items-start gap-3 flex-wrap">
+          <div>
+            <h3 class="text-sm font-bold m-0 mb-0.5">${model.name}</h3>
+            <span class="font-mono text-xs text-ink-faint">${model.size}</span>
+            <p class="mt-1.5 text-sm text-ink-dim leading-snug">${model.desc}</p>
+          </div>
+          <button class="btn" id="btn-${model.id}">Download</button>
+        </div>
+        <div class="hidden mt-3 bg-[#0d1117] rounded-lg px-3.5 py-3 font-mono text-xs leading-[1.85]" id="console-${model.id}"></div>
+        <div class="w-full h-[5px] bg-gray-200 rounded-full overflow-hidden mt-3 hidden" id="track-${model.id}">
+          <div class="h-full w-0 bg-accent transition-[width] duration-150" id="fill-${model.id}"></div>
+        </div>
+      `;
+      container.appendChild(card);
+      document.getElementById(`btn-${model.id}`).addEventListener('click', () => downloadWithProgress(model.id, model.name, model.url));
+    });
+  }
+
+  async function downloadWithProgress(id, name, url) {
+    const btn = document.getElementById(`btn-${id}`);
+    const track = document.getElementById(`track-${id}`);
+    const fill = document.getElementById(`fill-${id}`);
+    const consoleEl = document.getElementById(`console-${id}`);
+    const c = createConsole(consoleEl);
+
+    btn.disabled = true;
+    track.classList.remove('hidden');
+
+    const stepConnect = c.addStep('Connecting to model source');
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      c.complete(stepConnect);
+
+      const stepDownload = c.addStep('Downloading model file');
+      const contentLength = response.headers.get('content-length');
+      const total = contentLength ? parseInt(contentLength, 10) : 0;
+
+      let loaded = 0;
+      const reader = response.body.getReader();
+      const chunks = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        loaded += value.length;
+        if (total) {
+          const percent = (loaded / total) * 100;
+          fill.style.width = percent.toFixed(1) + "%";
+          c.detail(stepDownload, `${(loaded / (1024*1024)).toFixed(1)} MB / ${(total / (1024*1024)).toFixed(1)} MB — ${percent.toFixed(0)}%`);
+        } else {
+          c.detail(stepDownload, `${(loaded / (1024*1024)).toFixed(1)} MB downloaded`);
+        }
+      }
+      c.complete(stepDownload);
+      fill.style.width = "100%";
+
+      const stepSave = c.addStep('Saving to browser storage (IndexedDB)');
+      const blob = new Blob(chunks);
+      await dbPut({ name, size: (blob.size / (1024*1024)).toFixed(2) + " MB", blob, date: new Date().toLocaleDateString() });
+      c.complete(stepSave);
+      c.detail(stepSave, 'Stored locally — available in Manager and Studio');
+
+      btn.textContent = "Downloaded ✓";
+    } catch (err) {
+      const failedStep = c.addStep('Failed');
+      c.fail(failedStep, err.message);
+      btn.disabled = false;
+    }
+  }
+
+  // -------------------------------------------------------------
+  // Manager & Upload
+  // -------------------------------------------------------------
+  async function renderManagerList() {
+    const list = document.getElementById('modelList');
+    list.className = 'text-center py-8 px-4 text-ink-faint text-sm';
+    list.textContent = 'Loading local models…';
+    try {
+      const models = await dbGetAll();
+      if (!models.length) {
+        list.innerHTML = `No models saved on this device yet.<br>Download one, or upload your own .onnx file above.`;
+        return;
+      }
+      list.className = '';
+      list.innerHTML = '';
+      models.forEach(model => {
+        const item = document.createElement('div');
+        item.className = 'bg-white border border-gray-200 rounded-2xl p-4 mb-3.5 flex justify-between items-center gap-2.5';
+        const info = document.createElement('div');
+        info.innerHTML = `<div class="font-semibold text-sm">${model.name}</div><div class="font-mono text-xs text-ink-faint mt-0.5">${model.size} · saved ${model.date}</div>`;
+        const delBtn = document.createElement('button');
+        delBtn.className = 'btn btn-danger';
+        delBtn.textContent = 'Delete';
+        delBtn.addEventListener('click', () => deleteModel(model.name));
+        item.appendChild(info);
+        item.appendChild(delBtn);
+        list.appendChild(item);
+      });
+    } catch (err) {
+      list.innerHTML = `<span class="text-bad">Failed to load models: ${err.message}</span>`;
+    }
+  }
+
+  async function saveUploadedFiles(files) {
+    const errorEl = document.getElementById('uploadError');
+    errorEl.textContent = "";
+    const validFiles = Array.from(files).filter(f => f.name.toLowerCase().endsWith('.onnx'));
+    if (validFiles.length !== files.length) errorEl.textContent = "Some files were skipped because they weren't .onnx files.";
+    if (!validFiles.length) return;
+    try {
+      for (const file of validFiles) {
+        await dbPut({ name: file.name, size: (file.size / (1024*1024)).toFixed(2) + " MB", blob: file, date: new Date().toLocaleDateString() });
+      }
+      renderManagerList();
+    } catch (err) {
+      errorEl.textContent = "Failed to save file(s): " + err.message;
+    }
+  }
+
+  document.getElementById('fileInput').addEventListener('change', (e) => {
+    if (e.target.files.length) saveUploadedFiles(e.target.files);
+    e.target.value = "";
+  });
+
+  const dropzone = document.getElementById('dropzone');
+  dropzone.addEventListener('click', () => document.getElementById('fileInput').click());
+  dropzone.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); document.getElementById('fileInput').click(); }
+  });
+  ['dragenter', 'dragover'].forEach(evt => dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.classList.add('bg-accent-dim'); }));
+  ['dragleave', 'drop'].forEach(evt => dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.classList.remove('bg-accent-dim'); }));
+  dropzone.addEventListener('drop', (e) => { if (e.dataTransfer.files.length) saveUploadedFiles(e.dataTransfer.files); });
+
+  async function deleteModel(name) {
+    try { await dbDelete(name); renderManagerList(); } catch (err) { alert("Failed to delete: " + err.message); }
+  }
+
+  // -------------------------------------------------------------
+  // Studio state
+  // -------------------------------------------------------------
+  let currentSession = null;
+  let cutout = null;          // { canvas, width, height } — transparent PNG of the subject
+  let bgMode = 'transparent'; // 'transparent' | 'color' | 'image'
+  let bgColor = '#ffffff';
+  let bgImage = null;
+  let bgTransform = { scale: 1, offsetX: 0, offsetY: 0 };
+  let pendingFileUrl = null;
+  let cropper = null;
+
+  function setStatus(text, { spinning = false, error = false } = {}) {
+    const line = document.getElementById('studioStatusLine');
+    const textEl = document.getElementById('statusText');
+    line.style.color = error ? '#d92d20' : '#2f5eff';
+    textEl.textContent = text;
+    const existingSpinner = line.querySelector('.spinner');
+    if (spinning && !existingSpinner) { const s = document.createElement('span'); s.className = 'spinner'; line.prepend(s); }
+    else if (!spinning && existingSpinner) existingSpinner.remove();
+  }
+
+  function getInputSize() {
+    const field = document.getElementById('inputSizeField');
+    let v = parseInt(field.value, 10);
+    if (isNaN(v)) v = 320;
+    v = Math.min(1024, Math.max(32, v));
+    field.value = v;
+    return v;
+  }
+
+  async function populateStudioSelect() {
+    const select = document.getElementById('modelSelect');
+    select.innerHTML = '<option value="">-- Choose an installed model --</option>';
+    try {
+      const models = await dbGetAll();
+      models.forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.name;
+        opt.textContent = `${m.name} (${m.size})`;
+        select.appendChild(opt);
+      });
+    } catch (err) {
+      setStatus("Failed to load model list: " + err.message, { error: true });
+    }
+  }
+
+  document.getElementById('modelSelect').addEventListener('change', async (e) => {
+    const modelName = e.target.value;
+    const imgInput = document.getElementById('imageInput');
+    document.getElementById('processConsole').classList.add('hidden');
+    document.getElementById('processConsole').innerHTML = '';
+    document.getElementById('bgPanel').classList.add('hidden');
+    document.getElementById('downloadBtn').classList.add('hidden');
+    cutout = null;
+    currentSession = null;
+    imgInput.disabled = true;
+
+    if (!modelName) { setStatus("Select a model to begin"); return; }
+    setStatus("Loading model into memory…", { spinning: true });
+    try {
+      const record = await dbGet(modelName);
+      if (!record) throw new Error("Model not found in storage");
+      const arrayBuffer = await record.blob.arrayBuffer();
+      currentSession = await ort.InferenceSession.create(arrayBuffer, { executionProviders: ['wasm'] });
+      setStatus("Model ready — upload an image below");
+      imgInput.disabled = false;
+    } catch (err) {
+      setStatus("Failed to load model: " + err.message, { error: true });
+    }
+  });
+
+  // -------------------------------------------------------------
+  // Crop modal
+  // -------------------------------------------------------------
+  function setAspectActive(val) {
+    document.querySelectorAll('.aspect-btn').forEach(b => {
+      const active = b.dataset.ratio === val;
+      b.style.background = active ? '#eef1ff' : '#fff';
+      b.style.color = active ? '#2f5eff' : '#5b6472';
+    });
+  }
+
+  document.getElementById('imageInput').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (pendingFileUrl) URL.revokeObjectURL(pendingFileUrl);
+    pendingFileUrl = URL.createObjectURL(file);
+    document.getElementById('cropModal').classList.remove('hidden');
+    const img = document.getElementById('cropImage');
+    img.src = pendingFileUrl;
+
+    if (cropper) { cropper.destroy(); cropper = null; }
+    img.onload = () => {
+      cropper = new Cropper(img, { viewMode: 1, autoCropArea: 1, aspectRatio: NaN, background: false, responsive: true });
+      setAspectActive('NaN');
+    };
+    e.target.value = "";
+  });
+
+  document.querySelectorAll('#aspectButtons button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (!cropper) return;
+      const val = btn.dataset.ratio;
+      cropper.setAspectRatio(val === 'NaN' ? NaN : parseFloat(val));
+      setAspectActive(val);
+    });
+  });
+
+  function hideCropModal() {
+    document.getElementById('cropModal').classList.add('hidden');
+  }
+  function closeCropModal() {
+    hideCropModal();
+    if (cropper) { cropper.destroy(); cropper = null; }
+    if (pendingFileUrl) { URL.revokeObjectURL(pendingFileUrl); pendingFileUrl = null; }
+  }
+  document.getElementById('cropCancel').addEventListener('click', closeCropModal);
+  document.getElementById('cropConfirm').addEventListener('click', () => {
+    if (!cropper) return;
+    // Hide the modal immediately — getCroppedCanvas() and the pipeline can
+    // take a moment on large images, and the modal shouldn't sit open for it.
+    // The cropper instance itself is only torn down once we're done reading from it.
+    hideCropModal();
+    setTimeout(() => {
+      const croppedCanvas = cropper.getCroppedCanvas({ imageSmoothingQuality: 'high' });
+      const urlToRevoke = pendingFileUrl;
+      if (cropper) { cropper.destroy(); cropper = null; }
+      if (urlToRevoke) { URL.revokeObjectURL(urlToRevoke); pendingFileUrl = null; }
+      if (croppedCanvas) runPipeline(croppedCanvas);
+    }, 0);
+  });
+
+  // -------------------------------------------------------------
+  // Inference pipeline
+  // -------------------------------------------------------------
+  async function runPipeline(source) {
+    if (!currentSession) return;
+    const origW = source.width, origH = source.height;
+    document.getElementById('origDims').textContent = `${origW} × ${origH}px`;
+    document.getElementById('origPreview').src = source.toDataURL('image/png');
+
+    document.getElementById('bgPanel').classList.add('hidden');
+    document.getElementById('downloadBtn').classList.add('hidden');
+    cutout = null;
+
+    const consoleEl = document.getElementById('processConsole');
+    const c = createConsole(consoleEl);
+    setStatus('Running…', { spinning: true });
+
+    try {
+      const inputSize = getInputSize();
+
+      const stepResize = c.addStep(`Resizing a working copy to ${inputSize}×${inputSize}px`);
+      c.detail(stepResize, `Required by this model's architecture — your ${origW}×${origH}px crop is kept untouched`);
+      const inCanvas = document.createElement('canvas');
+      inCanvas.width = inputSize; inCanvas.height = inputSize;
+      const inCtx = inCanvas.getContext('2d');
+      inCtx.drawImage(source, 0, 0, inputSize, inputSize);
+      const imgData = inCtx.getImageData(0, 0, inputSize, inputSize).data;
+      c.complete(stepResize);
+
+      const stepPrep = c.addStep('Preparing tensor (normalizing pixel values)');
+      const size = inputSize * inputSize;
+      const floatData = new Float32Array(3 * size);
+      for (let i = 0; i < size; i++) {
+        const r = imgData[i*4] / 255, g = imgData[i*4+1] / 255, b = imgData[i*4+2] / 255;
+        floatData[i] = (r - 0.5) / 0.5;
+        floatData[size + i] = (g - 0.5) / 0.5;
+        floatData[2*size + i] = (b - 0.5) / 0.5;
+      }
+      c.complete(stepPrep);
+
+      const stepInfer = c.addStep('Running local inference (WebAssembly)');
+      const inputTensor = new ort.Tensor('float32', floatData, [1, 3, inputSize, inputSize]);
+      const feeds = {}; feeds[currentSession.inputNames[0]] = inputTensor;
+      const t0 = performance.now();
+      const results = await currentSession.run(feeds);
+      c.detail(stepInfer, `${(performance.now() - t0).toFixed(0)} ms on-device`);
+      c.complete(stepInfer);
+
+      const outputName = currentSession.outputNames[0];
+      const outputTensor = results[outputName];
+      const dims = outputTensor.dims;
+      const maskH = dims[dims.length - 2], maskW = dims[dims.length - 1];
+      const maskData = outputTensor.data;
+      let minV = Infinity, maxV = -Infinity;
+      for (let i = 0; i < maskData.length; i++) { if (maskData[i] < minV) minV = maskData[i]; if (maskData[i] > maxV) maxV = maskData[i]; }
+      const range = (maxV - minV) || 1;
+
+      const stepUpscale = c.addStep(`Upscaling mask to full size (${origW}×${origH}px)`);
+      const maskCanvas = document.createElement('canvas');
+      maskCanvas.width = maskW; maskCanvas.height = maskH;
+      const maskCtx = maskCanvas.getContext('2d');
+      const maskImgData = maskCtx.createImageData(maskW, maskH);
+      for (let i = 0; i < maskW * maskH; i++) {
+        const v = Math.round(((maskData[i] - minV) / range) * 255);
+        maskImgData.data[i*4] = 255; maskImgData.data[i*4+1] = 255; maskImgData.data[i*4+2] = 255; maskImgData.data[i*4+3] = v;
+      }
+      maskCtx.putImageData(maskImgData, 0, 0);
+      c.complete(stepUpscale);
+
+      const stepComposite = c.addStep('Cutting out subject at full resolution');
+      const outCanvas = document.createElement('canvas');
+      outCanvas.width = origW; outCanvas.height = origH;
+      const outCtx = outCanvas.getContext('2d');
+      outCtx.drawImage(source, 0, 0, origW, origH);
+      outCtx.globalCompositeOperation = 'destination-in';
+      outCtx.drawImage(maskCanvas, 0, 0, origW, origH);
+      outCtx.globalCompositeOperation = 'source-over';
+      c.complete(stepComposite);
+
+      cutout = { canvas: outCanvas, width: origW, height: origH };
+      bgImage = null;
+      bgTransform = { scale: 1, offsetX: 0, offsetY: 0 };
+      document.getElementById('bgPanel').classList.remove('hidden');
+      document.getElementById('downloadBtn').classList.remove('hidden');
+      setBgMode('transparent');
+      document.getElementById('outDims').textContent = `${origW} × ${origH}px`;
+
+      setStatus('Done — adjust the background below, then download if you like');
+    } catch (err) {
+      const failedStep = c.addStep('Failed');
+      c.fail(failedStep, err.message);
+      setStatus('Processing failed: ' + err.message, { error: true });
+    }
+  }
+
+  function renderComposite() {
+    if (!cutout) return;
+    const canvas = document.getElementById('compositeCanvas');
+    canvas.width = cutout.width;
+    canvas.height = cutout.height;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (bgMode === 'color') {
+      ctx.fillStyle = bgColor;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    } else if (bgMode === 'image' && bgImage) {
+      ctx.drawImage(bgImage, bgTransform.offsetX, bgTransform.offsetY, bgImage.naturalWidth * bgTransform.scale, bgImage.naturalHeight * bgTransform.scale);
+    }
+    ctx.drawImage(cutout.canvas, 0, 0);
+  }
+
+  // -------------------------------------------------------------
+  // Background mode switching
+  // -------------------------------------------------------------
+  function setBgMode(mode) {
+    bgMode = mode;
+    document.querySelectorAll('.bg-mode-btn').forEach(b => {
+      const active = b.dataset.mode === mode;
+      b.style.background = active ? '#2f5eff' : '#fff';
+      b.style.color = active ? '#fff' : '#5b6472';
+      b.style.borderColor = active ? '#2f5eff' : '#e5e7eb';
+    });
+    document.getElementById('colorControls').classList.toggle('hidden', mode !== 'color');
+    document.getElementById('imageControls').classList.toggle('hidden', mode !== 'image');
+    renderComposite();
+  }
+  document.querySelectorAll('.bg-mode-btn').forEach(b => b.addEventListener('click', () => setBgMode(b.dataset.mode)));
+  document.getElementById('downloadBtn').addEventListener('click', () => {
+    const canvas = document.getElementById('compositeCanvas');
+    canvas.toBlob(blob => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'background-removed.png'; a.click();
+      URL.revokeObjectURL(url);
+    }, 'image/png');
+  });
+
+  // -------------------------------------------------------------
+  // Custom color wheel (no native color input)
+  // -------------------------------------------------------------
+  const wheelCanvas = document.getElementById('colorWheel');
+  const wheelCtx = wheelCanvas.getContext('2d');
+  const lightBarCanvas = document.getElementById('valueBar');
+  const lightBarCtx = lightBarCanvas.getContext('2d');
+  // HSL instead of HSV: the wheel picks hue/saturation at a fixed midtone,
+  // and the bar sweeps white → hue → black, so it covers both tints (lighter
+  // than the pure hue) and shades (darker than the pure hue) in one control.
+  let hsl = { h: 0, s: 0, l: 1 };
+
+  function hslToRgb(h, s, l) {
+    h = h / 360;
+    let r, g, b;
+    if (s === 0) { r = g = b = l; }
+    else {
+      const hue2rgb = (p, q, t) => {
+        if (t < 0) t += 1;
+        if (t > 1) t -= 1;
+        if (t < 1/6) return p + (q - p) * 6 * t;
+        if (t < 1/2) return q;
+        if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+        return p;
+      };
+      const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+      const p = 2 * l - q;
+      r = hue2rgb(p, q, h + 1/3);
+      g = hue2rgb(p, q, h);
+      b = hue2rgb(p, q, h - 1/3);
+    }
+    return [Math.round(r*255), Math.round(g*255), Math.round(b*255)];
+  }
+  function rgbToHex(r, g, b) { return '#' + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join(''); }
+  function hexToRgb(hex) {
+    hex = hex.replace('#', '');
+    if (hex.length === 3) hex = hex.split('').map(c => c + c).join('');
+    const num = parseInt(hex, 16);
+    return [(num >> 16) & 255, (num >> 8) & 255, num & 255];
+  }
+  function rgbToHsl(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    let h, s, l = (max + min) / 2;
+    if (max === min) { h = s = 0; }
+    else {
+      const d = max - min;
+      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      switch (max) {
+        case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+        case g: h = (b - r) / d + 2; break;
+        case b: h = (r - g) / d + 4; break;
+      }
+      h /= 6;
+    }
+    return { h: h * 360, s, l };
+  }
+
+  function drawWheel() {
+    const size = wheelCanvas.width;
+    const radius = size / 2;
+    const img = wheelCtx.createImageData(size, size);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const dx = x - radius, dy = y - radius;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        const idx = (y*size + x) * 4;
+        if (dist <= radius) {
+          let angle = Math.atan2(dy, dx) * 180 / Math.PI;
+          if (angle < 0) angle += 360;
+          const sat = Math.min(1, dist / radius);
+          const [r, g, b] = hslToRgb(angle, sat, 0.5);
+          img.data[idx] = r; img.data[idx+1] = g; img.data[idx+2] = b; img.data[idx+3] = 255;
+        } else {
+          img.data[idx+3] = 0;
+        }
+      }
+    }
+    wheelCtx.putImageData(img, 0, 0);
+    const angRad = hsl.h * Math.PI / 180;
+    const r = hsl.s * radius;
+    const ix = radius + Math.cos(angRad) * r;
+    const iy = radius + Math.sin(angRad) * r;
+    wheelCtx.beginPath(); wheelCtx.arc(ix, iy, 5, 0, Math.PI*2); wheelCtx.strokeStyle = '#fff'; wheelCtx.lineWidth = 2; wheelCtx.stroke();
+    wheelCtx.beginPath(); wheelCtx.arc(ix, iy, 6.5, 0, Math.PI*2); wheelCtx.strokeStyle = 'rgba(0,0,0,0.35)'; wheelCtx.lineWidth = 1; wheelCtx.stroke();
+  }
+
+  function drawLightnessBar() {
+    const w = lightBarCanvas.width, h = lightBarCanvas.height;
+    const [r, g, b] = hslToRgb(hsl.h, hsl.s, 0.5);
+    const grad = lightBarCtx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, '#ffffff');
+    grad.addColorStop(0.5, `rgb(${r},${g},${b})`);
+    grad.addColorStop(1, '#000000');
+    lightBarCtx.fillStyle = grad;
+    lightBarCtx.fillRect(0, 0, w, h);
+    const y = (1 - hsl.l) * h;
+    lightBarCtx.strokeStyle = '#888'; lightBarCtx.lineWidth = 2;
+    lightBarCtx.strokeRect(0, Math.max(0, y - 2), w, 4);
+  }
+
+  function updateColorFromHsl() {
+    drawWheel(); drawLightnessBar();
+    const [r, g, b] = hslToRgb(hsl.h, hsl.s, hsl.l);
+    const hex = rgbToHex(r, g, b);
+    document.getElementById('colorSwatch').style.background = hex;
+    document.getElementById('hexInput').value = hex.toUpperCase();
+    bgColor = hex;
+    if (bgMode === 'color') renderComposite();
+  }
+
+  function wheelPointerHandler(e) {
+    const rect = wheelCanvas.getBoundingClientRect();
+    const scaleX = wheelCanvas.width / rect.width, scaleY = wheelCanvas.height / rect.height;
+    const x = (e.clientX - rect.left) * scaleX, y = (e.clientY - rect.top) * scaleY;
+    const radius = wheelCanvas.width / 2;
+    const dx = x - radius, dy = y - radius;
+    const dist = Math.min(radius, Math.sqrt(dx*dx + dy*dy));
+    let angle = Math.atan2(dy, dx) * 180 / Math.PI;
+    if (angle < 0) angle += 360;
+    hsl.h = angle; hsl.s = dist / radius;
+    updateColorFromHsl();
+  }
+  let wheelDragging = false;
+  wheelCanvas.addEventListener('pointerdown', e => { wheelDragging = true; wheelCanvas.setPointerCapture(e.pointerId); wheelPointerHandler(e); });
+  wheelCanvas.addEventListener('pointermove', e => { if (wheelDragging) wheelPointerHandler(e); });
+  wheelCanvas.addEventListener('pointerup', () => wheelDragging = false);
+  wheelCanvas.addEventListener('pointercancel', () => wheelDragging = false);
+
+  let barDragging = false;
+  function lightBarHandler(e) {
+    const rect = lightBarCanvas.getBoundingClientRect();
+    const scaleY = lightBarCanvas.height / rect.height;
+    const y = (e.clientY - rect.top) * scaleY;
+    hsl.l = 1 - Math.min(1, Math.max(0, y / lightBarCanvas.height));
+    updateColorFromHsl();
+  }
+  lightBarCanvas.addEventListener('pointerdown', e => { barDragging = true; lightBarCanvas.setPointerCapture(e.pointerId); lightBarHandler(e); });
+  lightBarCanvas.addEventListener('pointermove', e => { if (barDragging) lightBarHandler(e); });
+  lightBarCanvas.addEventListener('pointerup', () => barDragging = false);
+
+  document.getElementById('hexInput').addEventListener('change', e => {
+    let v = e.target.value.trim();
+    if (!/^#?[0-9a-fA-F]{3}$|^#?[0-9a-fA-F]{6}$/.test(v)) return;
+    if (!v.startsWith('#')) v = '#' + v;
+    const [r, g, b] = hexToRgb(v);
+    hsl = rgbToHsl(r, g, b);
+    updateColorFromHsl();
+  });
+
+  updateColorFromHsl(); // initial paint
+
+  // -------------------------------------------------------------
+  // Background image: pan + zoom (pointer drag, wheel, pinch)
+  // -------------------------------------------------------------
+  const compositeCanvas = document.getElementById('compositeCanvas');
+  let activePointers = new Map();
+  let lastPinchDist = null;
+
+  function canvasPoint(e) {
+    const rect = compositeCanvas.getBoundingClientRect();
+    const scaleX = compositeCanvas.width / rect.width, scaleY = compositeCanvas.height / rect.height;
+    return { x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY };
+  }
+
+  function zoomBg(factor, pivot) {
+    const newScale = Math.min(8, Math.max(0.05, bgTransform.scale * factor));
+    const actualFactor = newScale / bgTransform.scale;
+    bgTransform.offsetX = pivot.x - (pivot.x - bgTransform.offsetX) * actualFactor;
+    bgTransform.offsetY = pivot.y - (pivot.y - bgTransform.offsetY) * actualFactor;
+    bgTransform.scale = newScale;
+    renderComposite();
+  }
+
+  compositeCanvas.addEventListener('pointerdown', e => {
+    if (bgMode !== 'image' || !bgImage) return;
+    compositeCanvas.setPointerCapture(e.pointerId);
+    activePointers.set(e.pointerId, canvasPoint(e));
+  });
+  compositeCanvas.addEventListener('pointermove', e => {
+    if (bgMode !== 'image' || !bgImage || !activePointers.has(e.pointerId)) return;
+    const prev = activePointers.get(e.pointerId);
+    const curr = canvasPoint(e);
+    activePointers.set(e.pointerId, curr);
+    if (activePointers.size === 1) {
+      bgTransform.offsetX += curr.x - prev.x;
+      bgTransform.offsetY += curr.y - prev.y;
+      renderComposite();
+    } else if (activePointers.size === 2) {
+      const pts = Array.from(activePointers.values());
+      const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      const mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+      if (lastPinchDist) zoomBg(dist / lastPinchDist, mid);
+      lastPinchDist = dist;
+    }
+  });
+  function endPointer(e) {
+    activePointers.delete(e.pointerId);
+    if (activePointers.size < 2) lastPinchDist = null;
+  }
+  compositeCanvas.addEventListener('pointerup', endPointer);
+  compositeCanvas.addEventListener('pointercancel', endPointer);
+  compositeCanvas.addEventListener('pointerleave', e => { if (activePointers.size < 2) endPointer(e); });
+
+  compositeCanvas.addEventListener('wheel', e => {
+    if (bgMode !== 'image' || !bgImage) return;
+    e.preventDefault();
+    zoomBg(e.deltaY < 0 ? 1.08 : 0.92, canvasPoint(e));
+  }, { passive: false });
+
+  document.getElementById('bgZoomIn').addEventListener('click', () => bgImage && zoomBg(1.2, { x: compositeCanvas.width/2, y: compositeCanvas.height/2 }));
+  document.getElementById('bgZoomOut').addEventListener('click', () => bgImage && zoomBg(0.8, { x: compositeCanvas.width/2, y: compositeCanvas.height/2 }));
+  document.getElementById('bgReset').addEventListener('click', () => {
+    if (!bgImage || !cutout) return;
+    const scale = Math.max(cutout.width / bgImage.naturalWidth, cutout.height / bgImage.naturalHeight);
+    bgTransform = { scale, offsetX: (cutout.width - bgImage.naturalWidth*scale)/2, offsetY: (cutout.height - bgImage.naturalHeight*scale)/2 };
+    renderComposite();
+  });
+
+  document.getElementById('bgImageInput').addEventListener('change', e => {
+    const file = e.target.files[0];
+    if (!file || !cutout) return;
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      bgImage = img;
+      const scale = Math.max(cutout.width / img.naturalWidth, cutout.height / img.naturalHeight);
+      bgTransform = { scale, offsetX: (cutout.width - img.naturalWidth*scale)/2, offsetY: (cutout.height - img.naturalHeight*scale)/2 };
+      URL.revokeObjectURL(url);
+      renderComposite();
+    };
+    img.src = url;
+  });
+
+  renderCatalog();
+
+  // If models are already installed, skip the Downloader and land on Studio.
+  (async () => {
+    try {
+      const models = await dbGetAll();
+      if (models.length) {
+        const studioBtn = document.querySelector('.tab-btn[data-tab="studio"]');
+        switchTab('studio', studioBtn);
+      }
+    } catch (err) {
+      // IndexedDB unavailable or empty — default Downloader view stays as-is.
+    }
+  })();
+</script>
+</body>
+</html>
